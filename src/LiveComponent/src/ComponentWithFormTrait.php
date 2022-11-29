@@ -45,22 +45,14 @@ trait ComponentWithFormTrait
     public ?array $formValues = null;
 
     /**
-     * Tracks whether this entire component has been validated.
-     *
-     * This is used to know if validation should be automatically applied
-     * when rendering.
+     * Indicates if the form was submitted through a live component action instead of a regular rerender
      */
     #[LiveProp(writable: true)]
-    public bool $isValidated = false;
+    public bool $wasSubmitted = false;
 
-    /**
-     * Tracks which specific fields have been validated.
-     *
-     * Instead of validating the entire object (isValidated),
-     * the component can be validated, field-by-field.
-     */
+
     #[LiveProp(writable: true)]
-    public array $validatedFields = [];
+    public string $validationMode = 'late'; // Can be 'early|late'
 
     /**
      * Return the full, top-level, Form object that this component uses.
@@ -83,10 +75,12 @@ trait ComponentWithFormTrait
             // if a FormView is passed in and it contains any errors, then
             // we mark that this entire component has been validated so that
             // all validation errors continue showing on re-render
-            if ($this->formView && LiveFormUtility::doesFormContainAnyErrors($this->formView)) {
+            // TODO : changed code relies on submitted state (which is basically what sets the errors)
+            // TODO : Is that sufficient?
+            /*if ($this->formView && LiveFormUtility::doesFormContainAnyErrors($this->formView)) {
                 $this->isValidated = true;
                 $this->validatedFields = [];
-            }
+            }*/
         }
 
         // set the formValues from the initial form view's data
@@ -105,11 +99,9 @@ trait ComponentWithFormTrait
      * @internal
      */
     #[PreReRender]
-    public function submitFormOnRender(): void
+    public function hydrateFormOnRender(): void
     {
-        if (!$this->getFormInstance()->isSubmitted()) {
-            $this->submitForm($this->isValidated);
-        }
+        $this->hydrateForm();
     }
 
     /**
@@ -134,36 +126,48 @@ trait ComponentWithFormTrait
         return $this->formName;
     }
 
-    private function submitForm(bool $validateAll = true): void
+    private function hydrateForm(): FormInterface
     {
-        if (null !== $this->formView) {
-            throw new \LogicException('The submitForm() method is being called, but the FormView has already been built. Are you calling $this->getForm() - which creates the FormView - before submitting the form?');
-        }
+        /*if (null !== $this->formView) {
+            return $this->formView;
+        }*/
 
         $form = $this->getFormInstance();
+        if ($form->isSubmitted()) {
+            return $form;
+        }
+
         $form->submit($this->formValues);
 
-        if ($validateAll) {
-            // mark the entire component as validated
-            $this->isValidated = true;
-            // set fields back to empty, as now the *entire* object is validated.
-            $this->validatedFields = [];
-        } else {
-            // we only want to validate fields in validatedFields
-            // but really, everything is validated at this point, which
-            // means we need to clear validation on non-matching fields
-            $this->clearErrorsForNonValidatedFields($form, $form->getName());
+        $isValid = $form->isValid();
+        $unprocessable = false;
+        if ($this->validationMode === 'early' && !$isValid) {
+            $unprocessable = true;
+        }
+
+        if ($this->validationMode === 'late' && !$isValid) {
+            if ($this->wasSubmitted) {
+                $unprocessable = true;
+            } else {
+                $this->clearErrorsForNonValidatedFields($form);
+            }
         }
 
         // re-extract the "view" values in case the submitted data
         // changed the underlying data or structure of the form
         $this->formValues = $this->extractFormValues($this->getForm());
 
-        // remove any validatedFields that do not exist in data anymore
-        $this->validatedFields = LiveFormUtility::removePathsNotInData(
-            $this->validatedFields ?? [],
-            [$form->getName() => $this->formValues],
-        );
+        if ($unprocessable) {
+            throw new UnprocessableEntityHttpException('Form validation failed in component');
+        }
+
+        return $form;
+    }
+
+    private function submitForm(): void
+    {
+        $this->wasSubmitted = true;
+        $form = $this->hydrateForm();
 
         if (!$form->isValid()) {
             throw new UnprocessableEntityHttpException('Form validation failed in component');
@@ -252,10 +256,13 @@ trait ComponentWithFormTrait
         return $values;
     }
 
+    /**
+     * TODO : Bring back logic in here.
+     */
     private function clearErrorsForNonValidatedFields(FormInterface $form, string $currentPath = ''): void
     {
-        if ($form instanceof ClearableErrorsInterface && (!$currentPath || !\in_array($currentPath, $this->validatedFields, true))) {
-            $form->clearErrors();
+        if ($form instanceof ClearableErrorsInterface && (!$currentPath || !\in_array($currentPath, [], true))) {
+            $form->clearErrors(true);
         }
 
         foreach ($form as $name => $child) {
